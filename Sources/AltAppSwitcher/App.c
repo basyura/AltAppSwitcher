@@ -48,6 +48,7 @@ typedef struct SWinGroup
     HWND _Windows[64];
     uint32_t _WindowCount;
     GpBitmap* _IconBitmap;
+    uint32_t _IconHash;
 } SWinGroup;
 
 typedef struct SWinArr
@@ -961,6 +962,108 @@ static GpBitmap* GetIconFromExe(const char* exePath)
     return out;
 }
 
+static GpBitmap* GetBitmapFromIcon(HICON icon)
+{
+    if (!icon) return NULL;
+    
+    ICONINFO iconInfo;
+    MEM_INIT(iconInfo);
+    if (!GetIconInfo(icon, &iconInfo)) return NULL;
+    
+    BITMAP bm;
+    MEM_INIT(bm);
+    GetObject(iconInfo.hbmColor, sizeof(BITMAP), &bm);
+    
+    const uint32_t iconSize = bm.bmWidth;
+    GpBitmap* out = NULL;
+    GdipCreateBitmapFromScan0(iconSize, iconSize, 4 * iconSize, PixelFormat32bppARGB, NULL, &out);
+    
+    GpRect r = { 0, 0, iconSize, iconSize };
+    BitmapData dstData = {};
+    GdipBitmapLockBits(out, &r, 0, PixelFormat32bppARGB, &dstData);
+    GetBitmapBits(iconInfo.hbmColor, sizeof(uint32_t) * iconSize * iconSize, dstData.Scan0);
+    
+    // Check if color has non zero alpha
+    unsigned int* ptr = (unsigned int*)dstData.Scan0;
+    bool noAlpha = true;
+    for (int i = 0; i < iconSize * iconSize; i++)
+    {
+        if (ptr[i] & 0xFF000000)
+        {
+            noAlpha = false;
+            break;
+        }
+    }
+    
+    // If no alpha, use mask
+    if (noAlpha && iconInfo.hbmMask != NULL && iconSize <= 256)
+    {
+        BITMAP bitmapMask = {};
+        GetObject(iconInfo.hbmMask, sizeof(bitmapMask), (LPVOID)&bitmapMask);
+        unsigned int maskByteSize = bitmapMask.bmWidthBytes * bitmapMask.bmHeight;
+        static char maskData[256 * 256 * 1 / 8];
+        memset(maskData, 0, maskByteSize);
+        GetBitmapBits(iconInfo.hbmMask, maskByteSize, maskData);
+        for (int i = 0; i < iconSize * iconSize; i++)
+        {
+            unsigned int aFromMask = (0x1 & (maskData[i / 8] >> (7 - i % 8))) ? 0 : 0xFF000000;
+            ptr[i] = ptr[i] | aFromMask;
+        }
+    }
+    
+    GdipBitmapUnlockBits(out, &dstData);
+    
+    DeleteObject(iconInfo.hbmColor);
+    DeleteObject(iconInfo.hbmMask);
+    
+    return out;
+}
+
+static uint32_t GetIconHash(HICON icon)
+{
+    if (!icon) return 0;
+    
+    ICONINFO info;
+    MEM_INIT(info);
+    if (!GetIconInfo(icon, &info)) return 0;
+    
+    BITMAP bm;
+    MEM_INIT(bm);
+    if (!GetObject(info.hbmColor, sizeof(BITMAP), &bm))
+    {
+        DeleteObject(info.hbmColor);
+        DeleteObject(info.hbmMask);
+        return 0;
+    }
+    
+    // Create hash based on icon handle and bitmap properties
+    uint32_t hash = (uint32_t)((uintptr_t)icon & 0xFFFFFFFF);
+    hash ^= (uint32_t)(bm.bmWidth * bm.bmHeight * bm.bmBitsPixel);
+    hash ^= (uint32_t)bm.bmWidthBytes;
+    
+    // Try to get actual bitmap data for better differentiation
+    HDC hdc = GetDC(NULL);
+    HDC memDC = CreateCompatibleDC(hdc);
+    if (memDC)
+    {
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, info.hbmColor);
+        COLORREF pixel1 = GetPixel(memDC, 0, 0);
+        COLORREF pixel2 = GetPixel(memDC, bm.bmWidth/2, bm.bmHeight/2);
+        COLORREF pixel3 = GetPixel(memDC, bm.bmWidth-1, bm.bmHeight-1);
+        
+        hash ^= pixel1 ^ pixel2 ^ pixel3;
+        
+        SelectObject(memDC, oldBmp);
+        DeleteDC(memDC);
+    }
+    ReleaseDC(NULL, hdc);
+    
+    DeleteObject(info.hbmColor);
+    DeleteObject(info.hbmMask);
+    
+    return hash;
+}
+
 static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
 {
     if (!IsAltTabWindow(hwnd))
@@ -982,6 +1085,16 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
     static char moduleFileName[512];
     GetProcessFileName(PID, moduleFileName);
 
+    // Get window icon and calculate hash
+    HICON windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_BIG, 0);
+    if (!windowIcon)
+        windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
+    if (!windowIcon)
+        windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
+    if (!windowIcon)
+        windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
+    
+    uint32_t iconHash = GetIconHash(windowIcon);
     SWinGroupArr* winAppGroupArr = &(appData->_WinGroups);
 
     SWinGroup* group = NULL;
@@ -991,7 +1104,8 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         for (uint32_t i = 0; i < winAppGroupArr->_Size; i++)
         {
             SWinGroup* const _group = &(winAppGroupArr->_Data[i]);
-            if (!strcmp(_group->_ModuleFileName, moduleFileName))
+            if (!strcmp(_group->_ModuleFileName, moduleFileName) && 
+                _group->_IconHash == iconHash)
             {
                 group = _group;
                 break;
@@ -1020,6 +1134,7 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
 
         group = &winAppGroupArr->_Data[winAppGroupArr->_Size++];
         strcpy(group->_ModuleFileName, moduleFileName);
+        group->_IconHash = iconHash;
         ASSERT(group->_WindowCount == 0);
         // Icon
         ASSERT(group->_IconBitmap == NULL);
@@ -1042,7 +1157,13 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         (void)stdIcon;
         if (!isUWP)
         {
-            group->_IconBitmap = GetIconFromExe(group->_ModuleFileName);
+            // Try to use window icon first, fallback to exe icon
+            if (windowIcon) {
+                group->_IconBitmap = GetBitmapFromIcon(windowIcon);
+            } else {
+                group->_IconBitmap = GetIconFromExe(group->_ModuleFileName);
+            }
+            // Always get app name from exe (no title extraction)
             group->_AppName[0] = L'\0';
             static wchar_t exePath[MAX_PATH];
             mbstowcs(exePath, group->_ModuleFileName, MAX_PATH);
@@ -1292,6 +1413,7 @@ static void ClearWinGroupArr(SWinGroupArr* winGroups)
         }
         winGroups->_Data[i]._WindowCount = 0;
         winGroups->_Data[i]._AppName[0] = L'\0';
+        winGroups->_Data[i]._IconHash = 0;
     }
     winGroups->_Size = 0;
 }
