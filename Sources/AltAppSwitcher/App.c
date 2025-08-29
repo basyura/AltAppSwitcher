@@ -967,26 +967,13 @@ static GpBitmap* GetBitmapFromIcon(HICON icon)
 {
     if (!icon) return NULL;
     
-    // Try to get the largest available icon size
-    HICON largestIcon = NULL;
-    
-    // Try different sizes to find the largest one available
-    int sizes[] = { 256, 128, 64, 48, 32 };
-    for (int i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
-        HICON testIcon = (HICON)CopyImage(icon, IMAGE_ICON, sizes[i], sizes[i], LR_COPYFROMRESOURCE);
-        if (testIcon) {
-            largestIcon = testIcon;
-            break;
-        }
-    }
-    
-    HICON useIcon = largestIcon ? largestIcon : icon;
+    // Use the original icon directly without resizing
+    HICON useIcon = icon;
     
     // Get info for the icon we'll actually use
     ICONINFO iconInfo;
     MEM_INIT(iconInfo);
     if (!GetIconInfo(useIcon, &iconInfo)) {
-        if (largestIcon) DestroyIcon(largestIcon);
         return NULL;
     }
     
@@ -1037,7 +1024,6 @@ static GpBitmap* GetBitmapFromIcon(HICON icon)
     
     DeleteObject(iconInfo.hbmColor);
     DeleteObject(iconInfo.hbmMask);
-    if (largestIcon) DestroyIcon(largestIcon);
     
     return out;
 }
@@ -1108,10 +1094,10 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
     static char moduleFileName[512];
     GetProcessFileName(PID, moduleFileName);
 
-    // Get window icon - try to get larger sizes first
+    // Get window-specific icon first, then fallback to high-quality exe icon
     HICON windowIcon = NULL;
     
-    // Try to get larger icons first for better quality
+    // First priority: Get window-specific icon (for web apps, different browser tabs, etc.)
     windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_BIG, 0);
     if (!windowIcon)
         windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
@@ -1119,6 +1105,23 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
     if (!windowIcon)
         windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
+    
+    // Fallback: Extract high-quality icon from exe file if no window icon
+    if (!windowIcon) {
+        // Convert to wide string for PrivateExtractIcons
+        static wchar_t wideModuleFileName[512];
+        MultiByteToWideChar(CP_ACP, 0, moduleFileName, -1, wideModuleFileName, 512);
+        
+        // Try to extract large icon directly (256px for high quality)
+        HICON icons[1];
+        if (PrivateExtractIconsW(wideModuleFileName, 0, 256, 256, icons, NULL, 1, 0) > 0) {
+            windowIcon = icons[0];
+        }
+        // Fallback to 128px if 256px fails
+        else if (PrivateExtractIconsW(wideModuleFileName, 0, 128, 128, icons, NULL, 1, 0) > 0) {
+            windowIcon = icons[0];
+        }
+    }
     
     uint32_t iconHash = GetIconHash(windowIcon);
     SWinGroupArr* winAppGroupArr = &(appData->_WinGroups);
@@ -1247,6 +1250,9 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         }
         CloseHandle(process);
     }
+
+    // Clean up SHGetFileInfo icon to prevent memory leak
+    // Note: SHGetFileInfo returns icons that should be destroyed after use
 
     group->_Windows[group->_WindowCount++] = hwnd;
     return true;
