@@ -864,7 +864,8 @@ static void GetAppName(const wchar_t* exePath, wchar_t* out)
 static GpBitmap* GetIconFromExe(const char* exePath)
 {
     HMODULE module = LoadLibraryEx(exePath, NULL, LOAD_LIBRARY_AS_DATAFILE);
-    ASSERT(module != NULL);
+    if (module == NULL)
+        return NULL;
 
     // Finds icon resource in module
     uint32_t iconResID = 0xFFFFFFFF;
@@ -966,15 +967,36 @@ static GpBitmap* GetBitmapFromIcon(HICON icon)
 {
     if (!icon) return NULL;
     
+    // Try to get the largest available icon size
+    HICON largestIcon = NULL;
+    
+    // Try different sizes to find the largest one available
+    int sizes[] = { 256, 128, 64, 48, 32 };
+    for (int i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        HICON testIcon = (HICON)CopyImage(icon, IMAGE_ICON, sizes[i], sizes[i], LR_COPYFROMRESOURCE);
+        if (testIcon) {
+            largestIcon = testIcon;
+            break;
+        }
+    }
+    
+    HICON useIcon = largestIcon ? largestIcon : icon;
+    
+    // Get info for the icon we'll actually use
     ICONINFO iconInfo;
     MEM_INIT(iconInfo);
-    if (!GetIconInfo(icon, &iconInfo)) return NULL;
+    if (!GetIconInfo(useIcon, &iconInfo)) {
+        if (largestIcon) DestroyIcon(largestIcon);
+        return NULL;
+    }
     
     BITMAP bm;
     MEM_INIT(bm);
     GetObject(iconInfo.hbmColor, sizeof(BITMAP), &bm);
     
-    const uint32_t iconSize = bm.bmWidth;
+    const uint32_t iconSize = bm.bmWidth > 0 ? bm.bmWidth : 32;
+    
+    
     GpBitmap* out = NULL;
     GdipCreateBitmapFromScan0(iconSize, iconSize, 4 * iconSize, PixelFormat32bppARGB, NULL, &out);
     
@@ -1015,6 +1037,7 @@ static GpBitmap* GetBitmapFromIcon(HICON icon)
     
     DeleteObject(iconInfo.hbmColor);
     DeleteObject(iconInfo.hbmMask);
+    if (largestIcon) DestroyIcon(largestIcon);
     
     return out;
 }
@@ -1085,12 +1108,15 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
     static char moduleFileName[512];
     GetProcessFileName(PID, moduleFileName);
 
-    // Get window icon and calculate hash
-    HICON windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_BIG, 0);
-    if (!windowIcon)
-        windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
+    // Get window icon - try to get larger sizes first
+    HICON windowIcon = NULL;
+    
+    // Try to get larger icons first for better quality
+    windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_BIG, 0);
     if (!windowIcon)
         windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
+    if (!windowIcon)
+        windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
     if (!windowIcon)
         windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
     
@@ -1168,6 +1194,7 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
             static wchar_t exePath[MAX_PATH];
             mbstowcs(exePath, group->_ModuleFileName, MAX_PATH);
             GetAppName(exePath, group->_AppName);
+            
         }
         else if (isUWP)
         {
