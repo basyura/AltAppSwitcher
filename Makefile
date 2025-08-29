@@ -33,7 +33,7 @@ LFLAGS = -static -static-libgcc -Werror
 CFLAGS = -Wall -D ARCH_$(ARCH)=1 -target $(ARCH)-mingw64 -Werror
 
 ifeq ($(CONF), Debug)
-CFLAGS += -g3
+CFLAGS += -g3 -D_DEBUG
 else
 CFLAGS += -O3
 LFLAGS += -mwindows
