@@ -1869,10 +1869,11 @@ static void Draw(SAppData* appData, HDC dc, RECT clientRect)
     GpGraphics* pGraphics = NULL;
     ASSERT(Ok == GdipCreateFromHDC(pGraphRes->_DC, &pGraphics));
     // gdiplus/gdiplusenums.h
-    GdipSetSmoothingMode(pGraphics, SmoothingModeAntiAlias);
-    GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeHighQuality);
-    GdipSetInterpolationMode(pGraphics, InterpolationModeHighQualityBilinear); // InterpolationModeHighQualityBicubic
-    GdipSetTextRenderingHint(pGraphics, TextRenderingHintClearTypeGridFit);
+    GdipSetSmoothingMode(pGraphics, SmoothingModeHighQuality);
+    GdipSetCompositingQuality(pGraphics, CompositingQualityHighQuality);
+    GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeHalf);
+    GdipSetInterpolationMode(pGraphics, InterpolationModeHighQualityBicubic);
+    GdipSetTextRenderingHint(pGraphics, TextRenderingHintAntiAliasGridFit);
 
     const float containerSize = appData->_Metrics._Container;
     const float iconSize = appData->_Metrics._Icon;
