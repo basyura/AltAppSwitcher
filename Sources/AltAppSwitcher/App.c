@@ -518,9 +518,89 @@ static bool IsWindowOnMonitor(HWND hwnd, HMONITOR targetMonitor)
     }
 }
 
+typedef struct SShellOwnedCacheEntry
+{
+    HWND _Root;
+    DWORD _Tick;
+    bool _Valid;
+    bool _ShellOwned;
+} SShellOwnedCacheEntry;
+
+#define SHELL_OWNED_CACHE_SIZE 32
+#define SHELL_OWNED_CACHE_TTL 2000
+
+static bool IsShellOwnedWindow(HWND hwnd, HWND hwndRoot, HWND shellWindow)
+{
+    if (!hwndRoot || hwndRoot == hwnd)
+        return false;
+
+    static SShellOwnedCacheEntry cache[SHELL_OWNED_CACHE_SIZE];
+    static uint32_t nextSlot = 0;
+
+    const DWORD now = GetTickCount();
+    int staleIndex = -1;
+    for (uint32_t i = 0; i < SHELL_OWNED_CACHE_SIZE; i++)
+    {
+        if (!cache[i]._Valid)
+        {
+            staleIndex = (int)i;
+            continue;
+        }
+
+        if (cache[i]._Root == hwndRoot)
+        {
+            if ((DWORD)(now - cache[i]._Tick) <= SHELL_OWNED_CACHE_TTL)
+                return cache[i]._ShellOwned;
+            staleIndex = (int)i;
+            break;
+        }
+    }
+
+    bool shellOwned = false;
+    if (shellWindow && hwndRoot == shellWindow)
+    {
+        shellOwned = true;
+    }
+    else
+    {
+        DWORD rootPID = 0;
+        GetWindowThreadProcessId(hwndRoot, &rootPID);
+        if (rootPID)
+        {
+            char rootFile[MAX_PATH] = {0};
+            if (GetProcessFileName(rootPID, rootFile))
+            {
+                const char* rootBase = strrchr(rootFile, '\\');
+                rootBase = rootBase ? rootBase + 1 : rootFile;
+                if (!_stricmp(rootBase, "explorer.exe"))
+                {
+                    char rootClass[512] = {0};
+                    if (GetClassName(hwndRoot, rootClass, 512))
+                        shellOwned = !strcmp(rootClass, "Static");
+                }
+            }
+        }
+    }
+
+    const int targetIndex = staleIndex >= 0 ? staleIndex : (int)(nextSlot++ % SHELL_OWNED_CACHE_SIZE);
+    cache[targetIndex]._Root = hwndRoot;
+    cache[targetIndex]._ShellOwned = shellOwned;
+    cache[targetIndex]._Tick = now;
+    cache[targetIndex]._Valid = true;
+
+    return shellOwned;
+}
+
 static bool IsAltTabWindow(HWND hwnd)
 {
-    if (hwnd == GetShellWindow()) //Desktop
+    const HWND shellWindow = GetShellWindow();
+    if (hwnd == shellWindow) // Desktop
+        return false;
+
+    const HWND hwndRoot = GetAncestor(hwnd, GA_ROOTOWNER);
+    const bool shellOwned = IsShellOwnedWindow(hwnd, hwndRoot, shellWindow);
+    // Allow shell-owned dialogs like Run even if they have a different root owner
+    if (hwndRoot != hwnd && !shellOwned)
         return false;
 
     WINDOWINFO wi = {};
@@ -529,19 +609,9 @@ static bool IsAltTabWindow(HWND hwnd)
     if (!(wi.dwStyle & WS_VISIBLE))
         return false;
     // Chrome has sometime WS_EX_TOOLWINDOW while beeing an alttabable window
-    if ((wi.dwExStyle & WS_EX_TOOLWINDOW) != 0)
+    if (!shellOwned && (wi.dwExStyle & WS_EX_TOOLWINDOW) != 0)
          return false;
-    if ((wi.dwExStyle & WS_EX_TOPMOST) != 0)
-        return false;
-
-    // Start at the root owner
-    const HWND owner = GetWindow(hwnd, GW_OWNER); (void)owner;
-    const HWND parent = GetAncestor(hwnd, GA_PARENT); (void)parent;
-    const HWND dw = GetDesktopWindow(); (void)dw;
-    // Taskbar window if: owner is self or WS_EX_APPWINDOW is set
-    bool b = (wi.dwExStyle & WS_EX_APPWINDOW) != 0;(void)(b);
-    bool isOwned = owner != hwnd && owner != NULL;
-    if ((isOwned) && !(wi.dwExStyle & WS_EX_APPWINDOW))
+    if (!shellOwned && (wi.dwExStyle & WS_EX_TOPMOST) != 0)
         return false;
 
     if (!BelongsToCurrentDesktop(hwnd))
