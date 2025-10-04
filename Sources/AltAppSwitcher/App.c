@@ -18,6 +18,7 @@
 #include <shlwapi.h>
 #include <winreg.h>
 #include <windowsx.h>
+#include <shellapi.h>
 #include <unistd.h>
 // https://stackoverflow.com/questions/71437203/proper-way-of-activating-a-window-using-winapi
 #include <Initguid.h>
@@ -1035,6 +1036,192 @@ static GpBitmap* GetIconFromExe(const char* exePath)
     return out;
 }
 
+static bool GetIconDimensions(HICON icon, uint32_t* width, uint32_t* height)
+{
+    if (!icon) return false;
+
+    ICONINFO info;
+    MEM_INIT(info);
+    if (!GetIconInfo(icon, &info))
+        return false;
+
+    BITMAP bm;
+    MEM_INIT(bm);
+    bool ok = GetObject(info.hbmColor, sizeof(BITMAP), &bm) != 0;
+    if (ok)
+    {
+        if (width) *width = (uint32_t)bm.bmWidth;
+        if (height) *height = (uint32_t)(bm.bmHeight >= 0 ? bm.bmHeight : -bm.bmHeight);
+    }
+
+    DeleteObject(info.hbmColor);
+    DeleteObject(info.hbmMask);
+    return ok;
+}
+
+static uint32_t GetTargetIconRenderSize(const SAppData* appData)
+{
+    const float scale = max(appData->_Config._Scale, 0.5f);
+    const uint32_t systemIcon = (uint32_t)GetSystemMetrics(SM_CXICON);
+    uint32_t target = (uint32_t)(systemIcon * scale);
+    target = max(target, 32U);
+    target = min(target, 256U);
+    return target;
+}
+
+static uint32_t SampleIconColors(HICON icon, COLORREF* samples, uint32_t capacity)
+{
+    if (!icon || !samples || capacity == 0)
+        return 0;
+
+    ICONINFO info;
+    MEM_INIT(info);
+    if (!GetIconInfo(icon, &info))
+        return 0;
+
+    BITMAP bm;
+    MEM_INIT(bm);
+    if (!GetObject(info.hbmColor, sizeof(BITMAP), &bm))
+    {
+        DeleteObject(info.hbmColor);
+        DeleteObject(info.hbmMask);
+        return 0;
+    }
+
+    HDC screenDC = GetDC(NULL);
+    if (!screenDC)
+    {
+        DeleteObject(info.hbmColor);
+        DeleteObject(info.hbmMask);
+        return 0;
+    }
+
+    HDC memDC = CreateCompatibleDC(screenDC);
+    if (!memDC)
+    {
+        ReleaseDC(NULL, screenDC);
+        DeleteObject(info.hbmColor);
+        DeleteObject(info.hbmMask);
+        return 0;
+    }
+
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, info.hbmColor);
+    const uint32_t points[][2] = {
+        {0, 0},
+        {bm.bmWidth > 1 ? bm.bmWidth - 1 : 0, 0},
+        {bm.bmWidth / 2, bm.bmHeight / 2},
+        {0, bm.bmHeight > 1 ? bm.bmHeight - 1 : 0},
+        {bm.bmWidth > 1 ? bm.bmWidth - 1 : 0, bm.bmHeight > 1 ? bm.bmHeight - 1 : 0},
+        {bm.bmWidth / 2, bm.bmHeight > 1 ? bm.bmHeight - 1 : 0}
+    };
+    const uint32_t pointCount = (uint32_t)(sizeof(points) / sizeof(points[0]));
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < pointCount && count < capacity; i++)
+    {
+        const uint32_t maxX = bm.bmWidth > 0 ? (uint32_t)bm.bmWidth - 1 : 0;
+        const uint32_t maxY = bm.bmHeight > 0 ? (uint32_t)bm.bmHeight - 1 : 0;
+        const int x = (int)min(points[i][0], maxX);
+        const int y = (int)min(points[i][1], maxY);
+        const COLORREF color = GetPixel(memDC, x, y);
+        if (color != CLR_INVALID)
+            samples[count++] = color;
+    }
+
+    SelectObject(memDC, oldBmp);
+    DeleteDC(memDC);
+    ReleaseDC(NULL, screenDC);
+
+    DeleteObject(info.hbmColor);
+    DeleteObject(info.hbmMask);
+
+    return count;
+}
+
+static bool AreIconsVisuallySimilar(HICON a, HICON b)
+{
+    if (!a || !b)
+        return false;
+
+    COLORREF samplesA[6];
+    COLORREF samplesB[6];
+    const uint32_t countA = SampleIconColors(a, samplesA, 6);
+    const uint32_t countB = SampleIconColors(b, samplesB, 6);
+    if (countA == 0 || countB == 0)
+        return false;
+
+    const uint32_t compareCount = min(countA, countB);
+    if (compareCount == 0)
+        return false;
+
+    uint32_t sizeA[2] = { 0, 0 };
+    uint32_t sizeB[2] = { 0, 0 };
+    GetIconDimensions(a, &sizeA[0], &sizeA[1]);
+    GetIconDimensions(b, &sizeB[0], &sizeB[1]);
+
+    const uint32_t widthDiff = (sizeA[0] > sizeB[0]) ? (sizeA[0] - sizeB[0]) : (sizeB[0] - sizeA[0]);
+    const uint32_t heightDiff = (sizeA[1] > sizeB[1]) ? (sizeA[1] - sizeB[1]) : (sizeB[1] - sizeA[1]);
+
+    uint32_t diff = 0;
+    for (uint32_t i = 0; i < compareCount; i++)
+    {
+        const int dr = (int)GetRValue(samplesA[i]) - (int)GetRValue(samplesB[i]);
+        const int dg = (int)GetGValue(samplesA[i]) - (int)GetGValue(samplesB[i]);
+        const int db = (int)GetBValue(samplesA[i]) - (int)GetBValue(samplesB[i]);
+        const uint32_t drAbs = (uint32_t)(dr < 0 ? -dr : dr);
+        const uint32_t dgAbs = (uint32_t)(dg < 0 ? -dg : dg);
+        const uint32_t dbAbs = (uint32_t)(db < 0 ? -db : db);
+        diff += drAbs + dgAbs + dbAbs;
+    }
+
+    const uint32_t avg = diff / compareCount;
+    const bool similarColor = avg < 80;
+
+    const bool similarSize = (widthDiff <= 4) && (heightDiff <= 4);
+
+    return similarColor && similarSize;
+}
+
+static HICON ExtractBestIconHandle(const char* moduleFileName, uint32_t desiredSize)
+{
+    if (!moduleFileName || moduleFileName[0] == '\0')
+        return NULL;
+
+    static wchar_t wideModuleFileName[512];
+    MEM_INIT(wideModuleFileName);
+    MultiByteToWideChar(CP_ACP, 0, moduleFileName, -1, wideModuleFileName, 512);
+
+    const int sizeCandidates[] = { (int)desiredSize, 256, 192, 128, 96, 64, 48, 32 };
+    const uint32_t candidateCount = (uint32_t)(sizeof(sizeCandidates) / sizeof(sizeCandidates[0]));
+    for (uint32_t i = 0; i < candidateCount; i++)
+    {
+        const int size = sizeCandidates[i];
+        if (size <= 0)
+            continue;
+
+        HICON icon = NULL;
+        if (PrivateExtractIconsW(wideModuleFileName, 0, size, size, &icon, NULL, 1, 0) > 0 && icon)
+            return icon;
+    }
+
+    HICON large = NULL;
+    HICON small = NULL;
+    if (ExtractIconExW(wideModuleFileName, 0, &large, &small, 1) > 0)
+    {
+        if (large)
+        {
+            if (small)
+                DestroyIcon(small);
+            return large;
+        }
+        if (small)
+            return small;
+    }
+
+    if (small)
+        DestroyIcon(small);
+
+    return NULL;
+}
 static GpBitmap* GetBitmapFromIcon(HICON icon)
 {
     if (!icon) return NULL;
@@ -1166,35 +1353,75 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
     static char moduleFileName[512];
     GetProcessFileName(PID, moduleFileName);
 
-    // Get window-specific icon first, then fallback to high-quality exe icon
     HICON windowIcon = NULL;
-    
-    // First priority: Get window-specific icon (for web apps, different browser tabs, etc.)
+    enum IconOrigin
+    {
+        IconOriginNone,
+        IconOriginWindowMessage,
+        IconOriginClass,
+        IconOriginExtracted
+    };
+    enum IconOrigin iconOrigin = IconOriginNone;
+
     windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_BIG, 0);
+    if (windowIcon)
+    {
+        iconOrigin = IconOriginWindowMessage;
+    }
     if (!windowIcon)
+    {
         windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
+        if (windowIcon)
+            iconOrigin = IconOriginClass;
+    }
     if (!windowIcon)
+    {
         windowIcon = (HICON)SendMessage(hwnd, WM_GETICON, ICON_SMALL, 0);
+        if (windowIcon)
+            iconOrigin = IconOriginWindowMessage;
+    }
     if (!windowIcon)
+    {
         windowIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
-    
-    // Fallback: Extract high-quality icon from exe file if no window icon
-    if (!windowIcon) {
-        // Convert to wide string for PrivateExtractIcons
-        static wchar_t wideModuleFileName[512];
-        MultiByteToWideChar(CP_ACP, 0, moduleFileName, -1, wideModuleFileName, 512);
-        
-        // Try to extract large icon directly (256px for high quality)
-        HICON icons[1];
-        if (PrivateExtractIconsW(wideModuleFileName, 0, 256, 256, icons, NULL, 1, 0) > 0) {
-            windowIcon = icons[0];
-        }
-        // Fallback to 128px if 256px fails
-        else if (PrivateExtractIconsW(wideModuleFileName, 0, 128, 128, icons, NULL, 1, 0) > 0) {
-            windowIcon = icons[0];
+        if (windowIcon)
+            iconOrigin = IconOriginClass;
+    }
+
+    const uint32_t desiredIconSize = GetTargetIconRenderSize(appData);
+    uint32_t windowIconWidth = 0;
+    GetIconDimensions(windowIcon, &windowIconWidth, NULL);
+
+    bool destroyWindowIcon = false;
+    if (!isUWP)
+    {
+        const bool iconMissing = (windowIcon == NULL);
+        const bool iconTooSmall = (windowIconWidth > 0 && windowIconWidth < desiredIconSize);
+        if (iconMissing || iconTooSmall)
+        {
+            HICON extractedIcon = ExtractBestIconHandle(moduleFileName, desiredIconSize);
+            if (extractedIcon)
+            {
+                bool useExtracted = iconMissing || iconOrigin != IconOriginWindowMessage;
+                if (!useExtracted && iconTooSmall)
+                {
+                    useExtracted = AreIconsVisuallySimilar(windowIcon, extractedIcon);
+                }
+
+                if (useExtracted)
+                {
+                    windowIcon = extractedIcon;
+                    iconOrigin = IconOriginExtracted;
+                    destroyWindowIcon = true;
+                    GetIconDimensions(windowIcon, &windowIconWidth, NULL);
+                }
+                else
+                {
+                    DestroyIcon(extractedIcon);
+                }
+            }
         }
     }
-    
+
     uint32_t iconHash = GetIconHash(windowIcon);
     SWinGroupArr* winAppGroupArr = &(appData->_WinGroups);
 
@@ -1219,9 +1446,15 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, PID);
         if (!process)
         {
-            CloseHandle(process);
+            if (destroyWindowIcon && windowIcon)
+            {
+                DestroyIcon(windowIcon);
+                destroyWindowIcon = false;
+                windowIcon = NULL;
+            }
             return true;
         }
+
         HANDLE tok;
         OpenProcessToken(process, TOKEN_QUERY, &tok);
         TOKEN_ELEVATION elTok;
@@ -1231,7 +1464,16 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         CloseHandle(tok);
 
         if (elevated && !appData->_Elevated)
+        {
+            if (destroyWindowIcon && windowIcon)
+            {
+                DestroyIcon(windowIcon);
+                destroyWindowIcon = false;
+                windowIcon = NULL;
+            }
+            CloseHandle(process);
             return true;
+        }
 
         group = &winAppGroupArr->_Data[winAppGroupArr->_Size++];
         strcpy(group->_ModuleFileName, moduleFileName);
@@ -1258,12 +1500,25 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         (void)stdIcon;
         if (!isUWP)
         {
-            // Try to use window icon first, fallback to exe icon
-            if (windowIcon) {
+            if (windowIcon)
+            {
                 group->_IconBitmap = GetBitmapFromIcon(windowIcon);
-            } else {
+                if (destroyWindowIcon)
+                {
+                    DestroyIcon(windowIcon);
+                    destroyWindowIcon = false;
+                    windowIcon = NULL;
+                }
+                if (group->_IconBitmap == NULL)
+                {
+                    group->_IconBitmap = GetIconFromExe(group->_ModuleFileName);
+                }
+            }
+            else
+            {
                 group->_IconBitmap = GetIconFromExe(group->_ModuleFileName);
             }
+
             // Always get app name from exe (no title extraction)
             group->_AppName[0] = L'\0';
             static wchar_t exePath[MAX_PATH];
@@ -1327,9 +1582,12 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
     // Note: SHGetFileInfo returns icons that should be destroyed after use
 
     group->_Windows[group->_WindowCount++] = hwnd;
+    if (destroyWindowIcon && windowIcon)
+    {
+        DestroyIcon(windowIcon);
+    }
     return true;
 }
-
 static BOOL FillCurrentWinGroup(HWND hwnd, LPARAM lParam)
 {
     if (!IsAltTabWindow(hwnd))
