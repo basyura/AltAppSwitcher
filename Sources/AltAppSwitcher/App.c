@@ -1,4 +1,4 @@
-#define COBJMACROS
+﻿#define COBJMACROS
 #define NTDDI_VERSION NTDDI_WIN10
 #include <stdio.h>
 #include <string.h>
@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <psapi.h>
 #include <dwmapi.h>
 #include <winnt.h>
@@ -110,14 +111,15 @@ typedef struct SUWPIconMapElement
     wchar_t _UserModelID[512];
     wchar_t _Icon[MAX_PATH];
     wchar_t _AppName[MAX_PATH];
+    GpBitmap* _Bitmap;
 } SUWPIconMapElement;
 
-#define UWPICONMAPSIZE 16
+#define UWPICONMAPSIZE 64
 typedef struct SUWPIconMap
 {
     SUWPIconMapElement _Data[UWPICONMAPSIZE];
-    uint32_t _Head;
     uint32_t _Count;
+    uint32_t _Head;
 } SUWPIconMap;
 
 typedef struct SAppData
@@ -655,8 +657,9 @@ static void LoadIndirectString(const wchar_t* packagePath, const wchar_t* packag
 }
 
 //https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/AppxPackingDescribeAppx/cpp/DescribeAppx.cpp
-static void GetUWPIconAndAppName(HANDLE process, wchar_t* outIconPath, wchar_t* outAppName, SAppData* appData)
+static void GetUWPIconAndAppName(HANDLE process, wchar_t* outIconPath, wchar_t* outAppName, SAppData* appData, GpBitmap** outIconBitmap)
 {
+    if (outIconBitmap) *outIconBitmap = NULL;
     static wchar_t userModelID[512];
     {
         uint32_t length = 512;
@@ -671,10 +674,20 @@ static void GetUWPIconAndAppName(HANDLE process, wchar_t* outIconPath, wchar_t* 
             continue;
         wcscpy(outIconPath, iconMap->_Data[i0]._Icon);
         wcscpy(outAppName, iconMap->_Data[i0]._AppName);
+        if (outIconBitmap && iconMap->_Data[i0]._Bitmap)
+            *outIconBitmap = iconMap->_Data[i0]._Bitmap;
+        // LRU: 参照した要素を先頭へ再配置
+        if (i0 != Modulo(iconMap->_Head - 1, UWPICONMAPSIZE))
+        {
+            const uint32_t head = iconMap->_Head;
+            // シンプルにコピーで先頭に挿入（元位置は上書きされる）
+            iconMap->_Data[head] = iconMap->_Data[i0];
+            iconMap->_Head = Modulo(head + 1, UWPICONMAPSIZE);
+        }
         return;
     }
 
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    // COM 初期化はスレッド先頭で行う（StartAltAppSwitcher/WorkerThread）
 
     PACKAGE_ID pid[32];
     uint32_t pidSize = sizeof(pid);
@@ -763,7 +776,6 @@ static void GetUWPIconAndAppName(HANDLE process, wchar_t* outIconPath, wchar_t* 
         VERIFY(displayName != NULL);
         if (logoProp == NULL || displayName == NULL)
         {
-            CoUninitialize();
             return;
         }
     }
@@ -808,7 +820,6 @@ static void GetUWPIconAndAppName(HANDLE process, wchar_t* outIconPath, wchar_t* 
 
     if (hFind == INVALID_HANDLE_VALUE)
     {
-        CoUninitialize();
         return;
     }
 
@@ -854,14 +865,15 @@ static void GetUWPIconAndAppName(HANDLE process, wchar_t* outIconPath, wchar_t* 
     }
 
     {
-        wcscpy(iconMap->_Data[iconMap->_Head]._UserModelID, userModelID);
-        wcscpy(iconMap->_Data[iconMap->_Head]._Icon, outIconPath);
-        wcscpy(iconMap->_Data[iconMap->_Head]._AppName, outAppName);
+        const uint32_t head = iconMap->_Head;
+        wcscpy(iconMap->_Data[head]._UserModelID, userModelID);
+        wcscpy(iconMap->_Data[head]._Icon, outIconPath);
+        wcscpy(iconMap->_Data[head]._AppName, outAppName);
+        // Bitmap はここでは未ロード（次段でロードし保持）
+        iconMap->_Data[head]._Bitmap = NULL;
         iconMap->_Count = min(iconMap->_Count + 1, UWPICONMAPSIZE);
-        iconMap->_Head = Modulo(iconMap->_Head + 1, UWPICONMAPSIZE);
+        iconMap->_Head = Modulo(head + 1, UWPICONMAPSIZE);
     }
-
-    CoUninitialize();
 }
 
 #pragma pack(push)
@@ -901,7 +913,7 @@ static BOOL GetIconGroupName(HMODULE hModule, LPCSTR lpType, LPSTR lpName, LONG_
 
 static void GetAppName(const wchar_t* exePath, wchar_t* out)
 {
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    // COM 初期化はスレッド先頭で実施済み（StartAltAppSwitcher/WorkerThread）
     IShellItem2* shellItem = NULL;
     {
         // DWORD res = CoCreateInstance(&CLSID_ShellItem, NULL, CLSCTX_INPROC_SERVER, &IID_IShellItem2, (void**)&IShellItem2);
@@ -915,7 +927,6 @@ static void GetAppName(const wchar_t* exePath, wchar_t* out)
     {
         wcscpy(out, siStr);
         IShellItem2_Release(shellItem);
-        CoUninitialize();
         return;
     }
 
@@ -1531,8 +1542,34 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
             static wchar_t iconPath[MAX_PATH];
             iconPath[0] = L'\0';
             group->_AppName[0] = L'\0';
-            GetUWPIconAndAppName(process, iconPath, group->_AppName, appData);
-            GdipLoadImageFromFile(iconPath, &group->_IconBitmap);
+            GpBitmap* cachedBmp = NULL;
+            GetUWPIconAndAppName(process, iconPath, group->_AppName, appData, &cachedBmp);
+            if (cachedBmp)
+            {
+                // キャッシュからはクローンを使う（所有権分離）
+                GpImage* cloned = NULL;
+                if (Ok == GdipCloneImage((GpImage*)cachedBmp, &cloned) && cloned)
+                    group->_IconBitmap = (GpBitmap*)cloned;
+            }
+            else
+            {
+                // 初回のみロードし、キャッシュへ保持
+                if (iconPath[0] != L'\0')
+                {
+                    if (Ok == GdipLoadImageFromFile(iconPath, (GpImage**)&group->_IconBitmap) && group->_IconBitmap)
+                    {
+                        SUWPIconMap* iconMap = &appData->_UWPIconMap;
+                        const uint32_t last = Modulo(iconMap->_Head - 1, UWPICONMAPSIZE);
+                        if (wcscmp(iconMap->_Data[last]._AppName, group->_AppName) == 0)
+                        {
+                            // キャッシュにはクローンを保持（グループ側は別インスタンス所有）
+                            GpImage* cloned = NULL;
+                            if (Ok == GdipCloneImage((GpImage*)group->_IconBitmap, &cloned) && cloned)
+                                iconMap->_Data[last]._Bitmap = (GpBitmap*)cloned;
+                        }
+                    }
+                }
+            }
         }
 
         if (appData->_Config._AppSwitcherMode == AppSwitcherModeWindow)
@@ -1874,6 +1911,8 @@ static void ApplySwitchApp(const SWinGroup* winGroup)
 static DWORD WorkerThread(LPVOID data)
 {
     SAppData* appData = (SAppData*)data;
+    // スレッド単位で COM を初期化
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     HANDLE window = CreateWindowEx(WS_EX_TOPMOST, WORKER_CLASS_NAME, NULL, WS_POPUP,
         0, 0, 0, 0, HWND_MESSAGE, NULL, appData->_Instance,appData);
@@ -1891,6 +1930,7 @@ static DWORD WorkerThread(LPVOID data)
     EnterCriticalSection(&appData->_WorkerCS);
     appData->_WorkerWin = NULL;
     LeaveCriticalSection(&appData->_WorkerCS);
+    CoUninitialize();
     return 0;
 }
 
@@ -1951,13 +1991,12 @@ static void ApplyWithTimeout(SAppData* appData, unsigned int msg)
 static void ApplySwitchWin(HWND win)
 {
     RestoreWin(win);
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    // COM 初期化はスレッド先頭で実施済み（StartAltAppSwitcher/WorkerThread）
     IUIAutomation* UIA = NULL;
     DWORD res = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&UIA);
     ASSERT(SUCCEEDED(res))
     UIASetFocus(win, UIA);
     IUIAutomation_Release(UIA);
-    CoUninitialize();
 }
 
 static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
@@ -2440,6 +2479,8 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
 
     static SAppData _AppData;
     MEM_INIT(_AppData);
+    // プロセス（メインスレッド）で COM を初期化
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     {
         WNDCLASS wc = { };
@@ -2669,6 +2710,17 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
     }
 
     GdiplusShutdown(gdiplusToken);
+    // UWP アイコンキャッシュの解放
+    for (uint32_t i = 0; i < _AppData._UWPIconMap._Count; i++)
+    {
+        if (_AppData._UWPIconMap._Data[i]._Bitmap)
+        {
+            GdipDisposeImage(_AppData._UWPIconMap._Data[i]._Bitmap);
+            _AppData._UWPIconMap._Data[i]._Bitmap = NULL;
+        }
+    }
+    // COM 終了（メインスレッド）
+    CoUninitialize();
     UnregisterClass(CLASS_NAME, hInstance);
 
     if (restartAAS)
@@ -2684,3 +2736,5 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
     }
     return 0;
 }
+
+
