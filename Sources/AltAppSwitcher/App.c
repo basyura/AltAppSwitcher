@@ -141,6 +141,10 @@ typedef struct SAppData
     CRITICAL_SECTION _WorkerCS;
     HANDLE _WorkerWin;
     HMONITOR _MouseMonitor;
+    // Async icon loader
+    HWND _IconWorkerWin;
+    CRITICAL_SECTION _IconWorkerCS;
+    uint32_t _IconGen;
 } SAppData;
 
 typedef struct SFoundWin
@@ -162,6 +166,9 @@ static DWORD _MainThread;
 #define MSG_DEINIT_WIN (WM_USER + 7)
 #define MSG_DEINIT_APP (WM_USER + 8)
 #define MSG_CANCEL_APP (WM_USER + 9)
+
+// Async icon pipeline
+#define MSG_ICON_READY (WM_USER + 12)
 
 // Apply thread
 #define MSG_APPLY_APP (WM_USER + 1)
