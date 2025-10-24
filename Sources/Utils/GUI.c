@@ -207,9 +207,12 @@ static void InitGUIData(GUIData* guiData, HWND parent)
     SystemParametersInfo(SPI_GETNONCLIENTMETRICS, metrics.cbSize, &metrics, 0);
     metrics.lfCaptionFont.lfHeight *= 1.2;
     metrics.lfCaptionFont.lfWidth *= 1.2;
+    // Improve text rendering quality (antialiased/ClearType)
+    metrics.lfCaptionFont.lfQuality = CLEARTYPE_QUALITY;
     guiData->_Font = CreateFontIndirect(&metrics.lfCaptionFont);
     LOGFONT title = metrics.lfCaptionFont;
     title.lfWeight = FW_SEMIBOLD;
+    title.lfQuality = CLEARTYPE_QUALITY;
     guiData->_FontBold = CreateFontIndirect(&title);
     guiData->_CurrentFont = guiData->_Font;
     COLORREF col = LIGHT_COLOR;
